@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"net"
@@ -15,6 +18,11 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"nhooyr.io/websocket"
+)
+
+var (
+	configFile = flag.String("config", "./config.json",
+		"configuration file")
 )
 
 type cfgAll struct {
@@ -33,179 +41,291 @@ type cfgUdp struct {
 	Client string `json:"client"`
 }
 
-type Muxer struct {
-	config *cfgAll
-	outCh  map[uint16]chan []byte
-	inCh   chan []byte
-}
-
 func loadConfig(fileName string) (*cfgAll, error) {
-	file, err := os.Open(fileName)
+	data, err := os.ReadFile(fileName)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 	var cfg = &cfgAll{}
-	dec := json.NewDecoder(file)
-	err = dec.Decode(cfg)
-	if err != nil {
+	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
 	return cfg, nil
 }
 
-func NewMuxer(cfg *cfgAll) *Muxer {
-	return &Muxer{
-		config: cfg,
-	}
+func isCompleteUdpAddr(addr *net.UDPAddr) bool {
+	return !addr.IP.IsUnspecified() && (addr.Port != 0)
 }
 
-func (m *Muxer) Serve() error {
-	m.outCh = make(map[uint16]chan []byte, 16)
-	m.inCh = make(chan []byte, 128)
-	for _, ch := range m.config.Channels {
-		if ch.Udp != nil {
-			err := m.serveUdp(ch.Id, ch.Udp)
-			if err != nil {
-				return err
-			}
-		}
+func isMatchingAddr(spec, addr *net.UDPAddr) bool {
+	if !spec.IP.IsUnspecified() && !spec.IP.Equal(addr.IP) {
+		return false
 	}
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+	if spec.Port != 0 && spec.Port != addr.Port {
+		return false
+	}
+	return true
+}
 
-		conn, _, err := websocket.Dial(ctx, m.config.Relay, nil)
-		if err != nil {
-			return fmt.Errorf("websocket.Dial: %w", err)
-		}
-		log.Info("websocket connected")
-		conn.SetReadLimit(-1)
-		ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		err = conn.Write(ctx, websocket.MessageText, []byte(m.config.Uuid))
-		if err != nil {
-			return fmt.Errorf("websocket login: %w", err)
-		}
-		log.Info("websocket logged in")
-		ctx, cancel = context.WithCancel(context.Background())
-		defer cancel()
-		wg := &sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case buf := <-m.inCh:
-					err := conn.Write(ctx, websocket.MessageBinary, buf)
-					if err != nil {
-						log.Error(err)
-						cancel()
-						return
-					}
-				case <-ctx.Done():
-					err := conn.CloseNow()
-					if err != nil {
-						log.Error(err)
-					}
-					return
-				}
-			}
-		}()
+func readTofu(pc net.PacketConn, buf []byte) (int, *net.UDPAddr, error) {
+	if _, ok := pc.LocalAddr().(*net.UDPAddr); !ok {
+		return 0, nil, errors.New("invalid non-udp packetConn")
+	}
+	n, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		return 0, nil, err
+	}
+	return n, addr.(*net.UDPAddr), nil
+}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				typ, buf, err := conn.Read(ctx)
+type packetSink chan<- []byte
+
+type muxer struct {
+	sm sync.Map // id to packetSink
+}
+
+func (m *muxer) serveUdp(ctx0 context.Context, pc net.PacketConn, vchid uint16, clnt *net.UDPAddr) error {
+	ctx, cancel := context.WithCancelCause(ctx0)
+	defer cancel(nil)
+
+	prefix := make([]byte, binary.Size(vchid))
+	binary.BigEndian.PutUint16(prefix, vchid)
+
+	buf := make([]byte, 65536)
+
+	if !isCompleteUdpAddr(clnt) {
+		n, addr, err := readTofu(pc, buf)
+		if err != nil {
+			return err
+		}
+		m.gotTaggedPacket(append(prefix, buf[:n]...))
+		clnt = addr
+	}
+	// register as sink
+	sink := make(chan []byte, 16)
+	m.sm.Store(vchid, packetSink(sink))
+	defer m.sm.Delete(vchid)
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel(nil)
+		for {
+			select {
+			case packet := <-sink:
+				_, err := pc.WriteTo(packet, clnt)
 				if err != nil {
-					log.Error(err)
-					cancel()
+					cancel(err)
 					return
 				}
-				if len(buf) < 2 || typ != websocket.MessageBinary {
-					continue
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel(nil)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				cancel(err)
+				return
+			}
+			if !isMatchingAddr(clnt, addr.(*net.UDPAddr)) {
+				continue
+			}
+			m.gotTaggedPacket(append(prefix, buf[:n]...))
+		}
+	}()
+	return context.Cause(ctx)
+}
+
+func (m *muxer) dialWS(ctx0 context.Context, u, uuid string) (*websocket.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx0, 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx0, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetReadLimit(65538)
+	err = conn.Write(ctx, websocket.MessageText, []byte(uuid))
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (m *muxer) pollWS(ctx0 context.Context, u, uuid string) error {
+	log := log.WithField("ws", u)
+	ctx, cancel := context.WithCancelCause(ctx0)
+	defer cancel(nil)
+
+	conn, err := m.dialWS(ctx, u, uuid)
+	if err != nil {
+		cancel(err)
+		return err
+	}
+	log.Info("connected to ", u)
+	defer conn.CloseNow()
+
+	var wg sync.WaitGroup
+	my := make(chan []byte, 16)
+	m.sm.Store("ws", packetSink(my))
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel(nil)
+		for {
+			select {
+			case packet := <-my:
+				err := conn.Write(ctx, websocket.MessageBinary, packet)
+				if err != nil {
+					cancel(err)
+					return
 				}
-				chNum := binary.BigEndian.Uint16(buf[:2])
-				if ch, ok := m.outCh[chNum]; ok {
-					ch <- buf[2:]
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel(nil)
+		for {
+			typ, msg, err := conn.Read(ctx)
+			if err != nil {
+				cancel(err)
+				return
+			}
+			if typ != websocket.MessageBinary {
+				continue
+			}
+			if len(msg) < 2 {
+				continue
+			}
+			vchid := binary.BigEndian.Uint16(msg)
+			sink, ok := m.sm.Load(vchid)
+			if ok {
+				select {
+				case <-ctx.Done():
+					return
+				case sink.(packetSink) <- msg[2:]:
+				default:
 				}
+			}
+		}
+	}()
+	wg.Wait()
+	return context.Cause(ctx)
+}
+
+func (m *muxer) gotTaggedPacket(packet []byte) {
+	val, ok := m.sm.Load("ws")
+	if !ok {
+		// drop packet while there is no ws connection
+		return
+	}
+	sink := val.(packetSink)
+	select {
+	case sink <- packet:
+	default:
+	}
+}
+
+func Serve(ctx0 context.Context, configFileName string) error {
+	ctx, cancel := context.WithCancelCause(ctx0)
+	defer cancel(nil)
+	cfg, err := loadConfig(*configFile)
+	if err != nil {
+		return err
+	}
+	log.WithField("config", *configFile).Info("loaded config")
+
+	m := &muxer{}
+	var wg sync.WaitGroup
+
+	for _, cfgch := range cfg.Channels {
+		clientAddr, err := net.ResolveUDPAddr("udp",
+			cfgch.Udp.Client)
+
+		if err != nil {
+			return err
+		}
+		addr := cfgch.Udp.Bind
+		log := log.WithField("addr", addr)
+		if err != nil {
+			return err
+		}
+
+		log.Info("listening")
+		ln, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			return err
+		}
+		if ua, ok := ln.LocalAddr().(*net.UDPAddr); ok {
+			log.Info("Bound to ", ua.String())
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ctx.Done()
+			ln.Close()
+		}()
+
+		wg.Add(1)
+		vchid := cfgch.Id
+		go func() {
+			defer wg.Done()
+			err := m.serveUdp(ctx, ln, vchid, clientAddr)
+			if err != nil {
+				log.Error(err)
 			}
 		}()
-		log.Info("transmitting data")
-		wg.Wait()
-		err = conn.CloseNow()
-		if err != nil {
-			log.Error(err)
-		}
-		log.Info("lost websocket server, reconnect in 5s")
-		time.Sleep(5 * time.Second)
 	}
 
-}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			err := m.pollWS(ctx, cfg.Relay, cfg.Uuid)
+			if err != nil {
+				log.Error(err)
+			}
 
-func (m *Muxer) serveUdp(chId uint16, cfg *cfgUdp) error {
-	pc, err := net.ListenPacket("udp", cfg.Bind)
-	if err != nil {
-		return err
-	}
-	log.WithField("bind", pc.LocalAddr()).
-		WithField("channel", chId).
-		Info("UDP listening")
-	clientAddr, err := net.ResolveUDPAddr("udp", cfg.Client)
-	if err != nil {
-		return err
-	}
-	m.outCh[chId] = make(chan []byte)
-	go func() {
-		for {
-			buf := make([]byte, 65536)
-			binary.BigEndian.PutUint16(buf[:2], chId)
-			n, addr, err := pc.ReadFrom(buf[2:])
-			uAddr := addr.(*net.UDPAddr)
-			if clientAddr.IP == nil && clientAddr.Port == 0 {
-				clientAddr = uAddr
-				log.WithField("addr", clientAddr).Info("attaching client")
-			} else {
-				if !clientAddr.IP.Equal(uAddr.IP) ||
-					clientAddr.Port != uAddr.Port ||
-					clientAddr.Zone != uAddr.Zone {
-					log.WithField("expected", clientAddr).
-						WithField("actual", uAddr).
-						Info("client mismatch")
-					continue
-				}
-			}
-			if err != nil {
-				log.Fatal(err)
-			}
-			m.inCh <- append([]byte{}, buf[:2+n]...)
-		}
-	}()
-	go func() {
-		for {
-			buf := <-m.outCh[chId]
-			_, err := pc.WriteTo(buf, clientAddr)
-			if err != nil {
-				log.Fatal(err)
+			tm := time.NewTimer(5 * time.Second)
+			select {
+			case <-tm.C:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
-	return nil
+	wg.Wait()
+	return context.Cause(ctx)
 }
-
-var (
-	configFile = flag.String("config", "./config.json",
-		"configuration file")
-)
 
 func main() {
 	flag.Parse()
 	log.Info("starting")
-	cfg, err := loadConfig(*configFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.WithField("config", *configFile).Info("loaded config")
-	log.Fatal(NewMuxer(cfg).Serve())
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	sigc := make(chan os.Signal, 2)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigc
+		cancel(fmt.Errorf("Quit on %v", sig))
+	}()
+	log.Fatal(Serve(ctx, *configFile))
 }
