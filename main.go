@@ -26,9 +26,11 @@ var (
 )
 
 type cfgAll struct {
-	Relay    string       `json:"relay"`
-	Uuid     string       `json:"uuid"`
-	Channels []cfgChannel `json:"channels"`
+	Relay           string       `json:"relay"`
+	Uuid            string       `json:"uuid"`
+	PingIntervalSec int          `json:"ping_interval_sec"`
+	PingTimeoutSec  int          `json:"ping_timeout_sec"`
+	Channels        []cfgChannel `json:"channels"`
 }
 
 type cfgChannel struct {
@@ -81,7 +83,8 @@ func readTofu(pc net.PacketConn, buf []byte) (int, *net.UDPAddr, error) {
 type packetSink chan<- []byte
 
 type muxer struct {
-	sm sync.Map // id to packetSink
+	sm     sync.Map // id to packetSink
+	config *cfgAll
 }
 
 func (m *muxer) serveUdp(ctx0 context.Context, pc net.PacketConn, vchid uint16, clnt *net.UDPAddr) error {
