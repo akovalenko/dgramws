@@ -242,6 +242,7 @@ func (m *muxer) gotTaggedPacket(packet []byte) {
 }
 
 func Serve(ctx0 context.Context, configFileName string) error {
+	lc := net.ListenConfig{}
 	ctx, cancel := context.WithCancelCause(ctx0)
 	defer cancel(nil)
 	cfg, err := loadConfig(*configFile)
@@ -267,7 +268,7 @@ func Serve(ctx0 context.Context, configFileName string) error {
 		}
 
 		log.Info("listening")
-		ln, err := net.ListenPacket("udp", addr)
+		ln, err := lc.ListenPacket(ctx, "udp", addr)
 		if err != nil {
 			return err
 		}
@@ -288,7 +289,7 @@ func Serve(ctx0 context.Context, configFileName string) error {
 			defer wg.Done()
 			err := m.serveUdp(ctx, ln, vchid, clientAddr)
 			if err != nil {
-				log.Error(err)
+				cancel(err)
 			}
 		}()
 	}
@@ -296,10 +297,11 @@ func Serve(ctx0 context.Context, configFileName string) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		log := log.WithField("ws", cfg.Relay)
 		for {
 			err := m.pollWS(ctx, cfg.Relay, cfg.Uuid)
 			if err != nil {
-				log.Error(err)
+				log.Warn(err)
 			}
 
 			tm := time.NewTimer(5 * time.Second)
@@ -308,10 +310,19 @@ func Serve(ctx0 context.Context, configFileName string) error {
 			case <-ctx.Done():
 				return
 			}
+			log.Info("ws reconnect")
 		}
 	}()
 	wg.Wait()
 	return context.Cause(ctx)
+}
+
+type sigErr struct {
+	sig os.Signal
+}
+
+func (s *sigErr) Error() string {
+	return fmt.Sprintf("Quit: %v", s.sig)
 }
 
 func main() {
@@ -325,7 +336,10 @@ func main() {
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigc
-		cancel(fmt.Errorf("Quit on %v", sig))
+		cancel(&sigErr{sig})
 	}()
-	log.Fatal(Serve(ctx, *configFile))
+	err := Serve(ctx, *configFile)
+	if _, ok := err.(*sigErr); !ok {
+		log.Fatal(err)
+	}
 }
