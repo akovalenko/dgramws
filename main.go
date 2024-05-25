@@ -196,6 +196,35 @@ func (m *muxer) pollWS(ctx0 context.Context, u, uuid string) error {
 		}
 	}()
 
+	if m.config.PingIntervalSec != 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(time.Second * time.Duration(m.config.PingIntervalSec))
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					func() {
+						ctx1, cancel1 := context.WithTimeout(ctx,
+							time.Second*time.Duration(m.config.PingTimeoutSec))
+						defer cancel1()
+						started := time.Now()
+						err := conn.Ping(ctx1)
+						if err != nil {
+							cancel(err)
+							return
+						}
+						duration := time.Now().Sub(started)
+						log.WithField("rtt", duration).Info("WS ping-pong")
+					}()
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -251,7 +280,9 @@ func Serve(ctx0 context.Context, configFileName string) error {
 	}
 	log.WithField("config", *configFile).Info("loaded config")
 
-	m := &muxer{}
+	m := &muxer{
+		config: cfg,
+	}
 	var wg sync.WaitGroup
 
 	for _, cfgch := range cfg.Channels {

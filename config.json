@@ -1,6 +1,8 @@
 {
   "relay":"wss://relay.example.com/relay-path",
   "uuid":"1e6479a4-5060-414a-a03e-bc083b4d93cb",
+  "ping_interval_sec": 60,
+  "ping_timeout_sec": 5,
   "channels": [
     {"id": 1,
      "udp": {
