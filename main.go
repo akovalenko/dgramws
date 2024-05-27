@@ -210,25 +210,6 @@ func (m *muxer) pollWS(ctx0 context.Context, u, uuid string) error {
 		}
 	}()
 
-	if m.config.StatIntervalSec != 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ticker := time.NewTicker(time.Second * time.Duration(m.config.StatIntervalSec))
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-				case <-ctx.Done():
-					return
-				}
-				log.WithField("ws_in_pkt", m.stat.wsInPkt.Load()).
-					WithField("ws_out_pkt", m.stat.wsOutPkt.Load()).
-					Info("statistics")
-			}
-		}()
-	}
-
 	if m.config.PingIntervalSec != 0 {
 		log.Info("starting pinger")
 		wg.Add(1)
@@ -290,6 +271,25 @@ func (m *muxer) pollWS(ctx0 context.Context, u, uuid string) error {
 	}()
 	wg.Wait()
 	return context.Cause(ctx)
+}
+
+func (m *muxer) logPacketStat() {
+	log.WithField("ws_in_pkt", m.stat.wsInPkt.Load()).
+		WithField("ws_out_pkt", m.stat.wsOutPkt.Load()).
+		Info("statistics")
+}
+
+func (m *muxer) alwaysLogPacketStat(ctx context.Context) {
+	ticker := time.NewTicker(time.Second * time.Duration(m.config.StatIntervalSec))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+		m.logPacketStat()
+	}
 }
 
 func (m *muxer) gotTaggedPacket(packet []byte) {
@@ -357,6 +357,14 @@ func Serve(ctx0 context.Context, configFileName string) error {
 			if err != nil {
 				cancel(err)
 			}
+		}()
+	}
+
+	if m.config.StatIntervalSec != 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.alwaysLogPacketStat(ctx)
 		}()
 	}
 
