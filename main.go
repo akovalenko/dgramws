@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ type cfgAll struct {
 	Uuid            string       `json:"uuid"`
 	PingIntervalSec int          `json:"ping_interval_sec"`
 	PingTimeoutSec  int          `json:"ping_timeout_sec"`
+	StatIntervalSec int          `json:"stat_interval_sec"`
 	Channels        []cfgChannel `json:"channels"`
 }
 
@@ -85,6 +87,10 @@ type packetSink chan<- []byte
 type muxer struct {
 	sm     sync.Map // id to packetSink
 	config *cfgAll
+	stat   struct {
+		wsInPkt  atomic.Uint64
+		wsOutPkt atomic.Uint64
+	}
 }
 
 func (m *muxer) serveUdp(ctx0 context.Context, pc net.PacketConn, vchid uint16, clnt *net.UDPAddr) error {
@@ -97,10 +103,14 @@ func (m *muxer) serveUdp(ctx0 context.Context, pc net.PacketConn, vchid uint16, 
 	buf := make([]byte, 65536)
 
 	if !isCompleteUdpAddr(clnt) {
+		log.WithField("client", clnt).
+			Info("incomplete client addr, waiting for the first packet")
 		n, addr, err := readTofu(pc, buf)
 		if err != nil {
 			return err
 		}
+		log.WithField("client", addr).
+			Info("udp first packet identifies client")
 		m.gotTaggedPacket(append(prefix, buf[:n]...))
 		clnt = addr
 	}
@@ -188,6 +198,7 @@ func (m *muxer) pollWS(ctx0 context.Context, u, uuid string) error {
 		for {
 			select {
 			case packet := <-my:
+				m.stat.wsOutPkt.Add(1)
 				err := conn.Write(ctx, websocket.MessageBinary, packet)
 				if err != nil {
 					cancel(err)
@@ -199,7 +210,27 @@ func (m *muxer) pollWS(ctx0 context.Context, u, uuid string) error {
 		}
 	}()
 
+	if m.config.StatIntervalSec != 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(time.Second * time.Duration(m.config.StatIntervalSec))
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+				case <-ctx.Done():
+					return
+				}
+				log.WithField("ws_in_pkt", m.stat.wsInPkt.Load()).
+					WithField("ws_out_pkt", m.stat.wsOutPkt.Load()).
+					Info("statistics")
+			}
+		}()
+	}
+
 	if m.config.PingIntervalSec != 0 {
+		log.Info("starting pinger")
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -238,6 +269,7 @@ func (m *muxer) pollWS(ctx0 context.Context, u, uuid string) error {
 				cancel(err)
 				return
 			}
+			m.stat.wsInPkt.Add(1)
 			if typ != websocket.MessageBinary {
 				continue
 			}
@@ -307,7 +339,7 @@ func Serve(ctx0 context.Context, configFileName string) error {
 			return err
 		}
 		if ua, ok := ln.LocalAddr().(*net.UDPAddr); ok {
-			log.Info("Bound to ", ua.String())
+			log.Info("bound to ", ua.String())
 		}
 
 		wg.Add(1)
