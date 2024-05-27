@@ -181,7 +181,6 @@ func (m *muxer) pollWS(ctx0 context.Context, u, uuid string) error {
 
 	conn, err := m.dialWS(ctx, u, uuid)
 	if err != nil {
-		cancel(err)
 		return err
 	}
 	log.Info("connected to ", u)
